@@ -7,9 +7,10 @@ import time
 from dateutil import parser
 import logging
 import operator
+import argparse
 
 logging.basicConfig(level=logging.WARN, format="[%(name)s] %(levelname)s: %(message)s")
-logger = logging.getLogger(os.path.basename(__file__))
+log_exec = logging.getLogger(os.path.basename(__file__))
 
 class Request:
     """
@@ -37,13 +38,26 @@ class Request:
         self.timeobj = parser.parse(formatted_date)
 
         # seperately stores method used, resource requested, and protocol used
-        request = re.search(r'\"(.*?)\"', line).group(1)
-        self.method = request.split(' ')[0]   # GET, POST, etc.
-        self.resource = request.split(' ')[1] # file in /var/www (or similar)
+        try:
+            request = re.search(r'\"(.*?)\"', line).group(1)
+        except:
+            log_exec.debug('malformed request field in {}'.format(line))
+            request = None
+        try:
+            self.method = request.split(' ')[0]  # GET, POST, etc.
+        except:
+            log_exec.debug('malformed HTTP method entry in {}'.format(line))
+            self.method = None
+        try:
+            self.resource = request.split(' ')[1] # file in WEBROOT
+        except:
+            log_exec.debug('malformed resource request in {}'.format(line))
+            self.resource = None
         try:
             self.protocol = request.split(' ')[2] # 1.0, 1.1, etc
         except:
-            self.protocol = None # not always reported
+            log_exec.debug('malformed protocol entry in {}'.format(line))
+            self.protocol = None
 
         # stores server's reponse
         self.reply_code = int(line.split(' ')[-2])
@@ -63,8 +77,15 @@ class Counter:
     self.write(filename, n) writes n entries in self.counts dict to filename,
     sorted by value.
     """
-    def __init__(self):
+    def __init__(self, name, filename):
         self.counts = {}
+
+        # adds a simple logger
+        self.log = logging.getLogger(name)
+        self.log_hdl = logging.FileHandler(filename)
+        self.log_hdl.setFormatter(logging.Formatter('%(message)s'))
+        self.log.addHandler(self.log_hdl)
+        self.log.setLevel(logging.INFO)
 
     def update(self, key, n):
         """adds count n to the provided key"""
@@ -73,29 +94,28 @@ class Counter:
         except KeyError:
             self.counts[key] = n
 
-    def write(self, filename, n=10, write_vals=True):
+    def logger(self, n=10, write_vals=True):
         """
         writes the top n lines of the sorted dictionary self.counts. if
         write_vals == True, writes out key,value pairs, otherwise, prints only
         the sorted keys.
         """
         if n > len(self.counts):
-            logger.debug('number of hosts requested too large, printing all unique host counts')
+            log_exec.debug('number of hosts requested too large, printing all unique host counts')
             n = len(self.counts)
         if n <= 0:
-            logger.debug('less than one host requested, printing top host count')
+            log_exec.debug('less than one host requested, printing top host count')
             n = 1
 
         # sort keys by value
         outputs = sorted(self.counts.items(), key=operator.itemgetter(1), reverse=True)
         outputs = outputs[:n]
 
-        with open(filename, 'wb') as fid:
-            for output in outputs:
-                if write_vals:
-                    fid.write('{},{}\n'.format(output[0], output[1]))
-                else:
-                    fid.write('{}\n'.format(output[0]))
+        for output in outputs:
+            if write_vals:
+                self.log.info('{},{}'.format(output[0], output[1]))
+            else:
+                self.log.info('{}'.format(output[0]))
 
 
 class Guardian():
@@ -109,7 +129,7 @@ class Guardian():
     self.logger(host, line):
     self.write(filename): batch writes self.log to filename to reduce disk I/O.
     """
-    def __init__(self):
+    def __init__(self, name, filename):
         """
         self.attempts: dict of the times of the previous 3 failed logins/host.
         self.blocked:  dict of blocked hosts and time that they were blocked.
@@ -117,7 +137,13 @@ class Guardian():
         """
         self.attempts = {}
         self.blocked = {}
-        self.log = []
+
+        # adds a simple logger
+        self.log = logging.getLogger(name)
+        self.log_hdl = logging.FileHandler(filename)
+        self.log_hdl.setFormatter(logging.Formatter('%(message)s'))
+        self.log.addHandler(self.log_hdl)
+        self.log.setLevel(logging.INFO)
 
     def update_attempts(self, host, timeobj):
         try:
@@ -131,10 +157,10 @@ class Guardian():
 
         # host is an offender if last 3 attempts happened in under 20 sec
         if len(self.attempts[host]) == 3:
-            logger.debug('calculating delta b/t {} and {}'.format(self.attempts[host][2], self.attempts[host][0]))
+            log_exec.debug('calculating delta b/t {} and {}'.format(self.attempts[host][0], self.attempts[host][2]))
             delta = calc_delta_time(self.attempts[host][0], self.attempts[host][2])
             if delta <= 20:
-                logger.info('host {} blocked for 5 minutes starting at {}'.format(
+                log_exec.info('host {} blocked for 5 minutes starting at {}'.format(
                     host, timeobj.strftime("%d.%b %Y %H:%M:%S")))
                 self.blocked[host] = timeobj
 
@@ -155,13 +181,7 @@ class Guardian():
             blocked_time = self.blocked[host]
         except KeyError:
             return
-        self.log.append(line)
-
-    def write(self, filename):
-        """writes self.log to filename, and resets the log"""
-        with open(filename, 'wb') as fid:
-            for line in self.log:
-                fid.write('{}\n'.format(line))
+        self.log.info(line)
 
 
 def calc_delta_time(t1, t2):
@@ -171,7 +191,7 @@ def calc_delta_time(t1, t2):
     return(delta)
 
 
-def monitor_log(log, logdir):
+def main(log, logdir):
     """
     Opens log as a streaming text object, and passes each line to the parser.
     Parsed data is passed to the access dictionary, which keeps track of log
@@ -180,19 +200,20 @@ def monitor_log(log, logdir):
     number of attempts since then. If the difference between the first access
     attempt and the current attempt is greater than 20 seconds, this is reset.
     """
-    visit_count = Counter()
-    resource_bandwidth = Counter()
-    login_guardian = Guardian()
+    visit_count = Counter('visits per host', os.path.join(logdir, 'hosts.txt'))
+    resource_bandwidth = Counter('bandwidth used', os.path.join(logdir, 'resources.txt'))
+    login_guardian = Guardian('request denied', os.path.join(logdir, 'blocked.txt'))
     up_to_date = False # when true, does not attempt to write to logs
 
     try:
         fid = io.open(log, 'rb')
     except IOError:
-        logger.error('logfile to monitor {} does not exist or is not readable'.format(log))
+        log_exec.error('logfile to monitor {} does not exist or is not readable'.format(log))
         sys.exit(1)
 
     # run as a daemon
     while True:
+
         fid_loc = fid.tell()
         line = fid.readline()
 
@@ -200,14 +221,15 @@ def monitor_log(log, logdir):
             # parse the line into a Request object
             line = line.strip() # remove newline and other suprises
             data = Request(line.strip())
-            logger.debug('parsed {}: host={}, timestamp={}, method={}, resource={}, protocol={}, reply code={}, reply size (bytes)={}'.format(
+            log_exec.debug('parsed {}: host={}, timestamp={}, method={}, resource={}, protocol={}, reply code={}, reply size (bytes)={}'.format(
                 line, data.host, data.timestamp, data.method, data.resource, data.protocol, data.reply_code, data.reply_bytes))
 
             # feature 1: visit count by host
             visit_count.update(data.host, 1)
 
             # feature 2: bandwidth use by resource
-            resource_bandwidth.update(data.resource, data.reply_bytes)
+            if data.resource and data.reply_bytes:
+                resource_bandwidth.update(data.resource, data.reply_bytes)
 
             # feature 4: login monitoring
             if data.resource == '/login':
@@ -220,29 +242,34 @@ def monitor_log(log, logdir):
 
             up_to_date = False
         else:
-            # no more lines in log. write output and wait 10 ms
+            # no more lines in log. write summary stats and wait 10 ms
             if not up_to_date:
-                visit_count.write(os.path.join(logdir, 'hosts.txt'),
-                    n=10, write_vals=True)
-                resource_bandwidth.write(os.path.join(logdir, 'resources.txt'),
-                    n=float('inf'), write_vals=False)
-                login_guardian.write(os.path.join(logdir, 'blocked.txt'))
+                visit_count.logger(n=10, write_vals=True)
+                resource_bandwidth.logger(n=float('inf'), write_vals=False)
                 up_to_date = True
             else:
-                logger.info('awaiting changes in log')
+                log_exec.info('awaiting changes in log')
 
             time.sleep(10/1000.0)
             fid.seek(fid_loc)
 
 if __name__ == '__main__':
 
-    logger.info('starting')
-    debug = True
-    if debug:
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.INFO)
+    log_exec.info('starting')
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument("log", help="log file of web traffic to monitor")
+    argparser.add_argument("logdir", help="output directory for logs")
+    argparser.add_argument("-v", "--verbose", action="count",
+        help="increase output verbosity")
+    args = argparser.parse_args()
 
-    monitor_log(sys.argv[1], sys.argv[2])
+    if args.verbose > 1:
+        log_exec.setLevel(logging.DEBUG)
+    elif args.verbose == 1:
+        log_exec.setLevel(logging.INFO)
+    else:
+        log_exec.setLevel(logging.WARN)
+
+    main(args.log, args.logdir)
 
 
