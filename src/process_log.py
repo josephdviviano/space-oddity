@@ -4,6 +4,7 @@ import os, sys
 import io
 import re
 import time
+from datetime import datetime
 from dateutil import parser
 import logging
 import operator
@@ -157,7 +158,6 @@ class Guardian():
 
         # host is an offender if last 3 attempts happened in under 20 sec
         if len(self.attempts[host]) == 3:
-            log_exec.debug('calculating delta b/t {} and {}'.format(self.attempts[host][0], self.attempts[host][2]))
             delta = calc_delta_time(self.attempts[host][0], self.attempts[host][2])
             if delta <= 20:
                 log_exec.info('host {} blocked for 5 minutes starting at {}'.format(
@@ -191,6 +191,55 @@ def calc_delta_time(t1, t2):
     return(delta)
 
 
+def calc_time_windows(timedict):
+    """
+    Accepts an unordered dict of datetime object: count pairs. Returns, for each
+    datetime object, a formatted timestamp: count over the next 60 second pairs.
+
+    This converts the keys of the submitted dict into an ordered list of
+    datetime objects.
+
+    For each datetime object, this stores the visit count for that exact time,
+    and then searches forward in the list of datetime objects, adding the count.
+    If the search goes over the length of the list of datetime objects, or if
+    the difference in time between the intial object and search object is over
+    one hour (3600 seconds), this begins searching for the next datetime object.
+    """
+    # ordered list of timestamps so we can search chronologically
+    timeobj_ordered = timedict.keys()
+    start = datetime.now()
+    timeobj_ordered.sort()
+    log_exec.info('took {} to sort timedict'.format(datetime.now() - start))
+    end_idx = len(timeobj_ordered)-1
+
+    # stores the formatted timestamp: total visits over the next hour pairs
+    timedict_windowed = {}
+
+    # iterate through all timestamps chronologically
+    for i, timeobj in enumerate(timeobj_ordered):
+
+        if i % 10000 == 0:
+            log_exec.info('analyzing idx {}/{} at {}'.format(
+                i, end_idx, datetime.now()))
+
+        timestamp = timeobj.strftime('%d/%b/%Y:%H:%M:%S %z')
+        # add the number of visits for this exact timestamp
+        timedict_windowed[timestamp] = timedict[timeobj]
+
+        # when true, i is the last index and we're done
+        if i == end_idx:
+            return timedict_windowed
+
+        # search forward until datetime objects are > 1 hour (3600 sec) apart
+        j = i+1
+        while calc_delta_time(timeobj, timeobj_ordered[j]) < 3600:
+            timedict_windowed[timestamp] += timedict[timeobj_ordered[j]]
+            j += 1
+            # don't allow the search to go beyond the length of timeobj_ordered
+            if j > end_idx:
+                break
+
+
 def main(log, logdir):
     """
     Opens log as a streaming text object, and passes each line to the parser.
@@ -200,11 +249,14 @@ def main(log, logdir):
     number of attempts since then. If the difference between the first access
     attempt and the current attempt is greater than 20 seconds, this is reset.
     """
-    visit_count = Counter('visits per host', os.path.join(logdir, 'hosts.txt'))
-    resource_bandwidth = Counter('bandwidth used', os.path.join(logdir, 'resources.txt'))
-    login_guardian = Guardian('request denied', os.path.join(logdir, 'blocked.txt'))
-    up_to_date = False # when true, does not attempt to write to logs
+    start_time = datetime.now()
 
+    visit_count = Counter('visits per host', os.path.join(logdir, 'hosts.txt'))
+    data_used = Counter('bandwidth used', os.path.join(logdir, 'resources.txt'))
+    visit_time = Counter('visit per hour', os.path.join(logdir, 'hours.txt'))
+    guardian = Guardian('request denied', os.path.join(logdir, 'blocked.txt'))
+    up_to_date = False # when true, does not attempt to write to logs
+    wait_message = True # when true, prints a 'awaiting log activity' message
     try:
         fid = io.open(log, 'rb')
     except IOError:
@@ -221,37 +273,52 @@ def main(log, logdir):
             # parse the line into a Request object
             line = line.strip() # remove newline and other suprises
             data = Request(line.strip())
-            log_exec.debug('parsed {}: host={}, timestamp={}, method={}, resource={}, protocol={}, reply code={}, reply size (bytes)={}'.format(
-                line, data.host, data.timestamp, data.method, data.resource, data.protocol, data.reply_code, data.reply_bytes))
 
             # feature 1: visit count by host
             visit_count.update(data.host, 1)
 
             # feature 2: bandwidth use by resource
             if data.resource and data.reply_bytes:
-                resource_bandwidth.update(data.resource, data.reply_bytes)
+                data_used.update(data.resource, data.reply_bytes)
+
+            # feature 3: visits per hour
+            visit_time.update(data.timeobj, 1)
 
             # feature 4: login monitoring
             if data.resource == '/login':
                 # check if this host is currently blocked, remove expired blocks
-                login_guardian.update_block(data.host, data.timeobj)
+                guardian.update_block(data.host, data.timeobj)
                 if data.reply_code == 401:
                     # check last 3 attempts from this host, block if required
-                    login_guardian.update_attempts(data.host, data.timeobj)
-            login_guardian.logger(data.host, line)
+                    guardian.update_attempts(data.host, data.timeobj)
+            guardian.logger(data.host, line)
 
             up_to_date = False
+            wait_message = True
+
+        # log exhausted. write summary stats, wait 10 ms, check for new lines
         else:
-            # no more lines in log. write summary stats and wait 10 ms
             if not up_to_date:
+                # recomputed every time new data is recieved
                 visit_count.logger(n=10, write_vals=True)
-                resource_bandwidth.logger(n=float('inf'), write_vals=False)
+                data_used.logger(n=float('inf'), write_vals=False)
+
+                # calculate time window counts
+                visit_time.counts = calc_time_windows(visit_time.counts)
+                visit_time.logger(n=10, write_vals=True)
                 up_to_date = True
+
+                log_exec.info('took {} to complete'.format(datetime.now() - start_time))
+
+
             else:
-                log_exec.info('awaiting changes in log')
+                if wait_message:
+                    log_exec.info('awaiting changes in log')
+                    wait_message = False
 
             time.sleep(10/1000.0)
             fid.seek(fid_loc)
+
 
 if __name__ == '__main__':
 

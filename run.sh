@@ -4,5 +4,5 @@
 # for demonstration purposes, removes the logs with each iteration
 rm ./log_output/*.txt
 # NB: can be run with --debug for lots of fun output :)
-python ./src/process_log.py ./log_input/log.txt ./log_output/
+python ./src/process_log.py -v ./log_input/log.txt ./log_output/
 
