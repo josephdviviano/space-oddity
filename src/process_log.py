@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# coding: utf-8
 
 import os, sys
 import io
@@ -13,10 +14,9 @@ import argparse
 logging.basicConfig(level=logging.WARN, format="[%(name)s] %(levelname)s: %(message)s")
 log_exec = logging.getLogger(os.path.basename(__file__))
 
+
 class Request:
-    """
-    containins the parsed elements of the input log file
-    """
+    """containins the parsed elements of the input log file"""
     def __init__(self, line):
         """
         Accepts a log string and returns a structured format. Expects:
@@ -34,13 +34,16 @@ class Request:
         self.host = re.split(' - - ', line)[0]
 
         # stores the raw timestamp, and a python datetime object
-        self.timestamp = re.search(r'\[(.*?)\]', line).group(1)
+        searcher = re.compile(ur'\[(.*?)\]', re.UNICODE)
+        self.timestamp = searcher.search(line).group(1)
         formatted_date = self.timestamp.replace('/', ' ').replace(':', ' ', 1)
         self.timeobj = parser.parse(formatted_date)
 
         # seperately stores method used, resource requested, and protocol used
         try:
-            request = re.search(r'\"(.*?)\"', line).group(1)
+            # possible quotation marks in utf-8
+            searcher = re.compile(ur'[\u201c\u201d\"](.*?)[\u201c\u201d\"]', re.UNICODE)
+            request = searcher.search(line).group(1)
         except:
             log_exec.debug('malformed request field in {}'.format(line))
             request = None
@@ -71,7 +74,7 @@ class Request:
 
 class Counter:
     """
-    Feature 1+2: uses a dictionary to keep track of some item (ip address,
+    Feature 1-3: uses a dictionary to keep track of some item (ip address,
     resource) paired with some value (number of visits, bandwidth used)
 
     self.update(key, value) adds the key to self.counts dict, adding the value
@@ -158,9 +161,10 @@ class Guardian():
 
         # host is an offender if last 3 attempts happened in under 20 sec
         if len(self.attempts[host]) == 3:
-            delta = calc_delta_time(self.attempts[host][0], self.attempts[host][2])
+            delta = delta_time(self.attempts[host][0], self.attempts[host][2])
+            log_exec.debug('delta for host {} = {}'.format(host, delta))
             if delta <= 20:
-                log_exec.info('host {} blocked for 5 minutes starting at {}'.format(
+                log_exec.info('{} blocked for 5 minutes starting at {}'.format(
                     host, timeobj.strftime("%d.%b %Y %H:%M:%S")))
                 self.blocked[host] = timeobj
 
@@ -169,9 +173,9 @@ class Guardian():
         try:
             blocked_time = self.blocked[host]
         except KeyError:
-            return
+            return # host isn't blocked
 
-        delta = calc_delta_time(blocked_time, timeobj)
+        delta = delta_time(blocked_time, timeobj)
         if delta >= 300:
             self.blocked.pop(host) # 60sec*5min=300, delete host from blocked
 
@@ -184,7 +188,7 @@ class Guardian():
         self.log.info(line)
 
 
-def calc_delta_time(t1, t2):
+def delta_time(t1, t2):
     """returns difference in seconds between the datetime objects t2 and t1"""
     delta = t2 - t1
     delta = delta.days * 86400 + delta.seconds # 60sec*60mins*24hrs = 86400sec
@@ -232,7 +236,7 @@ def calc_time_windows(timedict):
 
         # search forward until datetime objects are > 1 hour (3600 sec) apart
         j = i+1
-        while calc_delta_time(timeobj, timeobj_ordered[j]) < 3600:
+        while delta_time(timeobj, timeobj_ordered[j]) < 3600:
             timedict_windowed[timestamp] += timedict[timeobj_ordered[j]]
             j += 1
             # don't allow the search to go beyond the length of timeobj_ordered
@@ -249,24 +253,22 @@ def main(log, logdir):
     number of attempts since then. If the difference between the first access
     attempt and the current attempt is greater than 20 seconds, this is reset.
     """
-    start_time = datetime.now()
+    start = datetime.now()
 
     visit_count = Counter('visits per host', os.path.join(logdir, 'hosts.txt'))
     data_used = Counter('bandwidth used', os.path.join(logdir, 'resources.txt'))
     visit_time = Counter('visit per hour', os.path.join(logdir, 'hours.txt'))
     guardian = Guardian('request denied', os.path.join(logdir, 'blocked.txt'))
-    up_to_date = False # when true, does not attempt to write to logs
-    wait_message = True # when true, prints a 'awaiting log activity' message
+
     try:
-        fid = io.open(log, 'rb')
+        fid = io.open(log, 'r', encoding='utf-8')
     except IOError:
-        log_exec.error('logfile to monitor {} does not exist or is not readable'.format(log))
+        log_exec.error('logfile to monitor {} is not accessible'.format(log))
         sys.exit(1)
 
     # run as a daemon
     while True:
 
-        fid_loc = fid.tell()
         line = fid.readline()
 
         if line:
@@ -278,46 +280,33 @@ def main(log, logdir):
             visit_count.update(data.host, 1)
 
             # feature 2: bandwidth use by resource
-            if data.resource and data.reply_bytes:
+            if data.resource:
                 data_used.update(data.resource, data.reply_bytes)
 
             # feature 3: visits per hour
             visit_time.update(data.timeobj, 1)
 
             # feature 4: login monitoring
+            # check login attempt against guardian.blocked, remove expired blocks
             if data.resource == '/login':
-                # check if this host is currently blocked, remove expired blocks
                 guardian.update_block(data.host, data.timeobj)
-                if data.reply_code == 401:
-                    # check last 3 attempts from this host, block if required
-                    guardian.update_attempts(data.host, data.timeobj)
+
+            # log events from blocked users
             guardian.logger(data.host, line)
 
-            up_to_date = False
-            wait_message = True
+            # check last 3 attempts from this host, block if required
+            if data.resource == '/login' and data.reply_code == 401:
+                guardian.update_attempts(data.host, data.timeobj)
 
-        # log exhausted. write summary stats, wait 10 ms, check for new lines
+        # log exhausted. write summary stats and exit. in production this could
+        # continue to wait for new lines and run in the background constantly.
         else:
-            if not up_to_date:
-                # recomputed every time new data is recieved
-                visit_count.logger(n=10, write_vals=True)
-                data_used.logger(n=float('inf'), write_vals=False)
-
-                # calculate time window counts
-                visit_time.counts = calc_time_windows(visit_time.counts)
-                visit_time.logger(n=10, write_vals=True)
-                up_to_date = True
-
-                log_exec.info('took {} to complete'.format(datetime.now() - start_time))
-
-
-            else:
-                if wait_message:
-                    log_exec.info('awaiting changes in log')
-                    wait_message = False
-
-            time.sleep(10/1000.0)
-            fid.seek(fid_loc)
+            visit_count.logger(n=10, write_vals=True)
+            data_used.logger(n=float('inf'), write_vals=False)
+            visit_time.counts = calc_time_windows(visit_time.counts)
+            visit_time.logger(n=10, write_vals=True)
+            log_exec.info('took {} to complete'.format(datetime.now() - start))
+            sys.exit()
 
 
 if __name__ == '__main__':
