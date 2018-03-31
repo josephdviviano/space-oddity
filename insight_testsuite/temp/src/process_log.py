@@ -46,22 +46,18 @@ class Request:
             searcher = re.compile(ur'[\u201c\u201d\"](.*?)[\u201c\u201d\"]', re.UNICODE)
             request = searcher.search(line).group(1)
         except:
-            log_exec.debug('malformed request field in {}'.format(line))
             request = None
         try:
             self.method = request.split(' ')[0]  # GET, POST, etc.
         except:
-            log_exec.debug('malformed HTTP method entry in {}'.format(line))
             self.method = None
         try:
             self.resource = request.split(' ')[1] # file in WEBROOT
         except:
-            log_exec.debug('malformed resource request in {}'.format(line))
             self.resource = None
         try:
             self.protocol = request.split(' ')[2] # 1.0, 1.1, etc
         except:
-            log_exec.debug('malformed protocol entry in {}'.format(line))
             self.protocol = None
 
         # stores server's reponse
@@ -76,13 +72,19 @@ class Request:
 class Counter:
     """
     Feature 1-3: uses a dictionary to keep track of some item (ip address,
-    resource) paired with some value (number of visits, bandwidth used)
+    resource) paired with some value (number of visits, bandwidth used).
 
     self.update(key, value) adds the key to self.counts dict, adding the value
-    self.write(filename, n) writes n entries in self.counts dict to filename,
-    sorted by value.
+    self.write(n, write_vals) writes n entries in self.counts dict to filename,
+    sorted by value. If write_vals is true, also writes the value pairs as a
+    comma seperated list.
     """
     def __init__(self, name, filename):
+        """
+        name: name of logging object
+        filename: path to output log file
+        self.counts: a dict containing counts associated with some key
+        """
         self.counts = {}
 
         # adds a simple logger
@@ -132,10 +134,11 @@ class Guardian():
     self.update_attepmts(host, timeobj):
     self.update_block(host, timeobj):
     self.logger(host, line):
-    self.write(filename): batch writes self.log to filename to reduce disk I/O.
     """
     def __init__(self, name, filename):
         """
+        name: name of logging object
+        filename: path to output log file
         self.attempts: dict of the times of the previous 3 failed logins/host.
         self.blocked:  dict of blocked hosts and time that they were blocked.
         self.log: a list of all requests by blocked hosts.
@@ -151,6 +154,11 @@ class Guardian():
         self.log.setLevel(logging.INFO)
 
     def update_attempts(self, host, timeobj):
+        """
+        keeps track of the last 3 attempts from each host. initiates or renews
+        a block if the last three attempts happened in 20 seconds or less by
+        adding the host to self.blocked
+        """
         try:
             self.attempts[host].append(timeobj)
         except KeyError:
@@ -209,12 +217,17 @@ def calc_time_windows(timedict):
     If the search goes over the length of the list of datetime objects, or if
     the difference in time between the intial object and search object is over
     one hour (3600 seconds), this begins searching for the next datetime object.
+
+    In the special case that the left and right hand side of the window
+    increment by the same number of seconds, the count is calculated by taking
+    the previous window's count, subtracting the value from the previous
+    iteration's first position, and adding the value from the position
+    immediately after the final position from the last iteration.
     """
     # ordered list of timestamps so we can search chronologically
     timeobj_ordered = timedict.keys()
     start = datetime.now()
     timeobj_ordered.sort()
-    log_exec.info('took {} to sort timedict'.format(datetime.now() - start))
     end_idx = len(timeobj_ordered)-1
 
     # stores the formatted timestamp: total visits over the next hour pairs
@@ -317,14 +330,16 @@ def main(log, logdir):
             data = Request(line)
 
             # feature 1: visit count by host
-            visit_count.update(data.host, 1)
+            if data.host:
+                visit_count.update(data.host, 1)
 
             # feature 2: bandwidth use by resource
             if data.resource:
                 data_used.update(data.resource, data.reply_bytes)
 
             # feature 3: visits per hour
-            visit_time.update(data.timeobj, 1)
+            if data.timeobj:
+                visit_time.update(data.timeobj, 1)
 
             # feature 4: login monitoring
             # check login attempt against guardian.blocked, remove expired blocks
@@ -332,7 +347,8 @@ def main(log, logdir):
                 guardian.update_block(data.host, data.timeobj)
 
             # log events from blocked users
-            guardian.logger(data.host, line)
+            if data.host:
+                guardian.logger(data.host, line)
 
             # check last 3 attempts from this host, block if required
             if data.resource == '/login' and data.reply_code == 401:
